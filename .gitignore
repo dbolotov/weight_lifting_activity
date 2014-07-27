@@ -1,0 +1,6 @@
+data/*
+submission/*
+.Rhistory
+report_testing.html
+report_testing.Rmd
+build.R

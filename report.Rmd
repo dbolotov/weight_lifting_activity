@@ -1,0 +1,186 @@
+---
+output: html_document
+---
+
+## Human Activity Recognition - How Well Did They Do That Exercise?
+
+### Summary
+
+With the advent of accelerometer-based smartphone apps and devices like Xbox Kinect, human activity recognition is in the spotlight. It's possible to track exercise using a wearable device connected to a smartphone, and to swing a controller to emulate tennis on the Nintendo Wii. Many of these devices track which motion is being performed, but is it possible to detect how well it is done? In this report, we investigate whether it's feasible to use machine learning to accurately distinguish between variations of one exercise from wearable sensor measurements. We build a random forest model and show that it is possible to predict how well an exercise is performed with an accuracy higher than 97%.
+
+### Introduction
+
+The dataset was collected from 6 individuals performing sets of 10 repetitions of a one-arm dumbell biceps curl, with various degrees of mistakes. Measurements were taken using 4 devices, worn on the forearm, arm, dumbell, and belt. Each observation is labeled as one of 5 classes, with only one ("A") being the correct execution. More information is available at the [research website](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises). The training and test data were obtained from [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).
+
+
+### Data Processing
+
+Starting from the dowloaded dataset, we remove columns with missing values and unused features (like subject names). We then partition the "training" data into train and cross-validation sets. The cross-validation set will be used to check model performance and estimate out-of-sample error.
+
+```{r setDir, echo=FALSE}
+setwd("E:/documents/progr/weight_lifting_activity")
+```
+
+Load necessary libraries:
+```{r loadLib, message=FALSE, warning=FALSE}
+library(caret)
+library(doParallel)
+```
+
+Load data, check dimensions, and find the number of columns with missing values. Missing values are coded as ```NA``` or a blank:
+```{r loadData}
+train_full <- read.csv("data/pml-training.csv",na.strings = c("NA", ""))
+test <- read.csv("data/pml-testing.csv",na.strings = c("NA", ""))
+
+rbind(dim(train_full),dim(test))
+```
+
+Find the number of columns with any missing values: 
+```{r colsWithNA}
+c(sum(colSums(is.na(train_full))!=0), sum(colSums(is.na(test))!=0))
+```
+
+Using ```unique```, we also see that the number of missing values per column is always one of two numbers, which is indicative of a systemic issue (we won't investigate this further in this report):
+```{r}
+unique(colSums(is.na(train_full)))
+```
+
+Remove the columns with ```NA``` entries:
+```{r removeNA}
+train_full <- train_full[, colSums(is.na(train_full))==0]
+test <- test[, colSums(is.na(test))==0]
+```
+
+
+Also remove other columns not used in the analysis and check dimensions again:
+```{r removeUnused}
+train_full <- subset(train_full, select=-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,
+                                           cvtd_timestamp,new_window,num_window))
+test <- subset(test, select=-c(X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,
+                                     cvtd_timestamp,new_window,num_window))
+rbind(dim(train_full),dim(test))
+```
+
+The number of columns has been reduced to 53, with 52 features and one class column.
+
+Partition the data into training and cross-validation sets:
+```{r partitionTrainSet}
+set.seed(1234)
+trainIndex = createDataPartition(train_full$classe, p = 0.70,list=FALSE)
+train = train_full[trainIndex,]
+xval = train_full[-trainIndex,]
+```
+The data is now ready for analysis.
+
+
+
+### Exploratory Analysis
+
+In this section, we explore the data a little, and check variability and correlation.
+
+Display some values from the data:
+```{r strData}
+str(train)
+```
+All features are numeric. Many features are on different scales, so it a good idea to center and scale (subtract mean and divide by the standard deviation) before building a model on the data. This will be done at a later step.
+
+Check for features with low variance or only one unique value:
+```{r checkVariability}
+nearZeroVar(train[,-53], saveMetrics=F)
+```
+
+No features fit the low variance criteria. However, since there are 50+ features in the dataset, and movement is recorded along 3 axes, it is likely that some attributes are highly correlated. Create a correlation matrix and count number of features with correlation higher than 0.8:
+```{r createCorrMatrix}
+M <- abs(cor(train[,-53]))
+diag(M) <- 0 #for each variable, correlation with itself is 1. Set this to 0.
+dim(which(M > 0.8, arr.ind=T))[1]
+```
+
+There is a high number of highly-correlated features in the dataset. Principal component analysis can be used to project the features onto a lower-dimensional space.
+
+First, find all principal components. The ```preProcess``` function in ```caret``` centers and scales the data automatically when ```method``` is set to ```pca```:
+
+```{r pcaAll}
+preProc <- preProcess(train[,-53],method=("pca"),pcaComp=52)
+train_PC <- predict(preProc,train[,-53])
+```
+
+Calculate and plot the variance explained by each component. Also plot the cutoff at which 95% and 99% of the variance are explained:
+```{r pcaPlot, fig.width=6, fig.height=5}
+train_PC_sd <- apply(train_PC,2,sd)
+var_explained <- train_PC_sd^2 / sum(train_PC_sd^2)
+
+plot(var_explained,type="b",main="Variance explained by Principal Components",
+     xlab="Components (sorted by decreasing variance explained)",
+     ylab="Variance Explained")
+abline(v = which(cumsum(var_explained)>=.95)[1],col="red")
+abline(v = which(cumsum(var_explained)>=.99)[1],col="blue")
+text(x=30,y=0.15,labels="95% explained",cex=0.7)
+text(x=41,y=0.10,labels="99% explained",cex=0.7)
+
+```
+
+The plot shows that the top 25 components explain 95%, and the top 36 explain 99% of the variance.
+
+Rerun the PCA preprocessing, this time keeping enough components to explain 99% of the variance, and apply the PCA transformation to the crossvalidation and test sets:
+```{r pca99}
+preProc <- preProcess(train[,-53],method=("pca"),thresh=.99) 
+train_PC <- predict(preProc,train[,-53])
+
+xval_PC <- predict(preProc,xval[,-53])
+test_PC <- predict(preProc,test[,-53])
+dim(train_PC)
+```
+
+These features are used to build the model.
+
+
+
+### Model Building
+
+We choose to build a random forest model. The ```method="cv",number=5``` options in ```trainControl``` separate the data into 5 folds for cross-validation during training.
+
+To allow for multicore processing, we use ```makeCluster()``` and ```registerDoParallel()``` commands. Otherwise the train() function will use one core, and training will take much longer.
+
+```{r buildRF, message=FALSE, warning=FALSE, cache=FALSE}
+
+# cl <- makeCluster(detectCores()/2) #use half of available cores
+cl <- makeCluster(6)
+registerDoParallel(cl)
+
+modFit <- train(train$classe ~ ., method = "rf", data = train_PC, 
+                trControl = trainControl(method = "cv",number = 5))
+
+```
+
+
+### Results
+
+
+Find the accuracy on training and crossvalidation sets:
+```{r findAccuracy, message=FALSE, warning=FALSE}
+CM_train <- confusionMatrix(train$classe,predict(modFit,train_PC)) #train results
+CM_xval <- confusionMatrix(xval$classe,predict(modFit,xval_PC)) #xval results
+train_error = 1 - CM_train$overall[1]
+xval_error = 1 - CM_xval$overall[1]
+```
+
+While the model perfectly fits the training set (in-sample error is `r train_error`), the cross-validation error is `r xval_error`. We thus estimate that the out-of-sample error will be about `r xval_error`. The cross-validation confusion matrix summarizes how classes were misclassified:
+
+```{r}
+CM_xval$table
+```
+
+It looks like class ```C``` was misclassified the most.
+
+To complete the second part of the assignment, generate predictions for the test set:
+```{r generateTestPreds}
+test_prediction <- predict(modFit,test_PC)
+print(test_prediction)
+```
+Checked against the auto-grader, the test set accuracy is 100%.
+
+### Conclusion
+
+Using a random forest model on data preprocessed with principal component analysis, this report shows that it's possible to fairly accurately distinguish between variations of the same motion pattern.
+
